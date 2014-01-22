@@ -10,6 +10,21 @@ Interactive shell for ansible built-in tab completion for all the modules.
 
 ![yolo](http://i.imgur.com/rxYlS9T.gif)
 
+
+# Install
+
+## Install ansible
+```
+apt-get update
+apt-get install python-pip python-dev git -y
+pip install PyYAML jinja2 paramiko
+git clone https://github.com/ansible/ansible.git
+cd ansible
+make install
+mkdir /etc/ansible
+cp ~/ansible/examples/hosts /etc/ansible/
+```
+
 ## Availabe commands:
 
 ```
@@ -17,6 +32,8 @@ cd
 list
 serial
 ```
+
+
 ## Usage:
 ```
 [root@aaa ~]# ansible-shell
