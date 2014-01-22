@@ -1,0 +1,546 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import cmd
+import ansible.runner
+from ansible.color import stringc, codeCodes
+import ansible.constants as C
+from ansible import utils
+import ansible.utils.module_docs as module_docs
+import sys
+import os
+import pprint
+import pwd
+import readline
+import rlcompleter
+import atexit
+from optparse import OptionParser
+
+
+import stat
+import ansible.playbook
+import ansible.utils.template
+from ansible import errors
+from ansible import callbacks
+from ansible.color import ANSIBLE_COLOR
+from ansible.callbacks import display
+
+class colorizer(object):
+    def __init__(self, color):
+        self.color = color
+
+    def __enter__(self):
+        sys.stdout.write("\033[")
+        sys.stdout.write(codeCodes[self.color])
+        sys.stdout.write("m")
+
+    def __exit__(self, *args):
+        sys.stdout.write("\033[0m")
+
+def colorize(lead, num, color):
+    """ Print 'lead' = 'num' in 'color' """
+    if num != 0 and ANSIBLE_COLOR and color is not None:
+        return "%s%s%-15s" % (stringc(lead, color), stringc("=", color), stringc(str(num), color))
+    else:
+        return "%s=%-4s" % (lead, str(num))
+
+def hostcolor(host, stats, color=True):
+    if ANSIBLE_COLOR and color:
+        if stats['failures'] != 0 or stats['unreachable'] != 0:
+            return "%-37s" % stringc(host, 'red')
+        elif stats['changed'] != 0:
+            return "%-37s" % stringc(host, 'yellow')
+        else:
+            return "%-37s" % stringc(host, 'green')
+    return "%-26s" % host
+
+
+def playmain(hosts,args):
+    ''' run ansible-playbook operations '''
+
+    # convert args str to list
+    newargs = args.split()
+
+    # create parser for CLI options
+    parser = utils.base_parser(
+        constants=C,
+        usage = "%prog playbook.yml",
+        connect_opts=True,
+        runas_opts=True,
+        subset_opts=True,
+        check_opts=True,
+        diff_opts=True
+    )
+    parser.add_option('-e', '--extra-vars', dest="extra_vars", action="append",
+        help="set additional variables as key=value or YAML/JSON", default=[])
+    parser.add_option('-t', '--tags', dest='tags', default='all',
+        help="only run plays and tasks tagged with these values")
+    parser.add_option('--skip-tags', dest='skip_tags',
+        help="only run plays and tasks whose tags do not match these values")
+    parser.add_option('--syntax-check', dest='syntax', action='store_true',
+        help="perform a syntax check on the playbook, but do not execute it")
+    parser.add_option('--list-tasks', dest='listtasks', action='store_true',
+        help="list all tasks that would be executed")
+    parser.add_option('--step', dest='step', action='store_true',
+        help="one-step-at-a-time: confirm each task before running")
+    parser.add_option('--start-at-task', dest='start_at',
+        help="start the playbook at the task matching this name")
+
+    options, args = parser.parse_args(newargs)
+
+    if len(args) == 0:
+        parser.print_help(file=sys.stderr)
+        return 1
+    '''
+    if options.inventory == '/etc/ansible/hosts':
+        inventory=hosts
+    else:
+    '''
+
+    inventory = ansible.inventory.Inventory(options.inventory)
+    inventory.subset(options.subset)
+    if len(inventory.list_hosts()) == 0:
+        raise errors.AnsibleError("provided hosts list is empty")
+
+    sshpass = None
+    sudopass = None
+    if not options.listhosts and not options.syntax and not options.listtasks:
+        options.ask_pass = options.ask_pass or C.DEFAULT_ASK_PASS
+        # Never ask for an SSH password when we run with local connection
+        if options.connection == "local":
+            options.ask_pass = False
+        options.ask_sudo_pass = options.ask_sudo_pass or C.DEFAULT_ASK_SUDO_PASS
+        (sshpass, sudopass) = utils.ask_passwords(ask_pass=options.ask_pass, ask_sudo_pass=options.ask_sudo_pass)
+        options.sudo_user = options.sudo_user or C.DEFAULT_SUDO_USER
+
+    extra_vars = {} #{'hosts': ['192.168.200.130', 'localhost']}
+    for extra_vars_opt in options.extra_vars:
+        if extra_vars_opt.startswith("@"):
+            # Argument is a YAML file (JSON is a subset of YAML)
+            extra_vars = utils.combine_vars(extra_vars, utils.parse_yaml_from_file(extra_vars_opt[1:]))
+        elif extra_vars_opt and extra_vars_opt[0] in '[{':
+            # Arguments as YAML
+            extra_vars = utils.combine_vars(extra_vars, utils.parse_yaml(extra_vars_opt))
+        else:
+            # Arguments as Key-value
+            extra_vars = utils.combine_vars(extra_vars, utils.parse_kv(extra_vars_opt))
+
+    #extra_vars ={'hosts': ['192.168.200.130', 'localhost']}
+    extra_vars ={'hosts': hosts}
+
+    only_tags = options.tags.split(",")
+    skip_tags = options.skip_tags
+    if options.skip_tags is not None:
+        skip_tags = options.skip_tags.split(",")
+
+    for playbook in args:
+        if not os.path.exists(playbook):
+            raise errors.AnsibleError("the playbook: %s could not be found" % playbook)
+        if not (os.path.isfile(playbook) or stat.S_ISFIFO(os.stat(playbook).st_mode)):
+            raise errors.AnsibleError("the playbook: %s does not appear to be a file" % playbook)
+
+    # run all playbooks specified on the command line
+    for playbook in args:
+
+        # let inventory know which playbooks are using so it can know the basedirs
+        inventory.set_playbook_basedir(os.path.dirname(playbook))
+
+        stats = callbacks.AggregateStats()
+        playbook_cb = callbacks.PlaybookCallbacks(verbose=utils.VERBOSITY)
+        if options.step:
+            playbook_cb.step = options.step
+        if options.start_at:
+            playbook_cb.start_at = options.start_at
+        runner_cb = callbacks.PlaybookRunnerCallbacks(stats, verbose=utils.VERBOSITY)
+
+        pb = ansible.playbook.PlayBook(
+            playbook=playbook,
+            module_path=options.module_path,
+            inventory=inventory,
+            forks=options.forks,
+            remote_user=options.remote_user,
+            remote_pass=sshpass,
+            callbacks=playbook_cb,
+            runner_callbacks=runner_cb,
+            stats=stats,
+            timeout=options.timeout,
+            transport=options.connection,
+            sudo=options.sudo,
+            sudo_user=options.sudo_user,
+            sudo_pass=sudopass,
+            extra_vars=extra_vars,
+            private_key_file=options.private_key_file,
+            only_tags=only_tags,
+            skip_tags=skip_tags,
+            check=options.check,
+            diff=options.diff
+        )
+
+        if options.listhosts or options.listtasks or options.syntax:
+            print ''
+            print 'playbook: %s' % playbook
+            print ''
+            playnum = 0
+            for (play_ds, play_basedir) in zip(pb.playbook, pb.play_basedirs):
+                playnum += 1
+                play = ansible.playbook.Play(pb, play_ds, play_basedir)
+                label = play.name
+                if options.listhosts:
+                    hosts = pb.inventory.list_hosts(play.hosts)
+                    print '  play #%d (%s): host count=%d' % (playnum, label, len(hosts))
+                    for host in hosts:
+                        print '    %s' % host
+                if options.listtasks:
+                    matched_tags, unmatched_tags = play.compare_tags(pb.only_tags)
+
+                    # Remove skipped tasks
+                    matched_tags = matched_tags - set(pb.skip_tags)
+
+                    unmatched_tags.discard('all')
+                    unknown_tags = ((set(pb.only_tags) | set(pb.skip_tags)) -
+                                    (matched_tags | unmatched_tags))
+
+                    if unknown_tags:
+                        continue
+                    print '  play #%d (%s):' % (playnum, label)
+
+                    for task in play.tasks():
+                        if (set(task.tags).intersection(pb.only_tags) and not
+                            set(task.tags).intersection(pb.skip_tags)):
+                            if getattr(task, 'name', None) is not None:
+                                # meta tasks have no names
+                                print '    %s' % task.name
+                print ''
+            continue
+
+        if options.syntax:
+            # if we've not exited by now then we are fine.
+            print 'Playbook Syntax is fine'
+            return 0
+
+        failed_hosts = []
+        unreachable_hosts = []
+
+        try:
+
+            pb.run()
+
+            hosts = sorted(pb.stats.processed.keys())
+            display(callbacks.banner("PLAY RECAP"))
+            playbook_cb.on_stats(pb.stats)
+
+            for h in hosts:
+                t = pb.stats.summarize(h)
+                if t['failures'] > 0:
+                    failed_hosts.append(h)
+                if t['unreachable'] > 0:
+                    unreachable_hosts.append(h)
+
+            retries = failed_hosts + unreachable_hosts
+
+            if len(retries) > 0:
+                filename = pb.generate_retry_inventory(retries)
+                if filename:
+                    display("           to retry, use: --limit @%s\n" % filename)
+
+            for h in hosts:
+                t = pb.stats.summarize(h)
+
+                display("%s : %s %s %s %s" % (
+                    hostcolor(h, t),
+                    colorize('ok', t['ok'], 'green'),
+                    colorize('changed', t['changed'], 'yellow'),
+                    colorize('unreachable', t['unreachable'], 'red'),
+                    colorize('failed', t['failures'], 'red')),
+                    screen_only=True
+                )
+
+                display("%s : %s %s %s %s" % (
+                    hostcolor(h, t, False),
+                    colorize('ok', t['ok'], None),
+                    colorize('changed', t['changed'], None),
+                    colorize('unreachable', t['unreachable'], None),
+                    colorize('failed', t['failures'], None)),
+                    log_only=True
+                )
+
+
+            print ""
+            if len(failed_hosts) > 0:
+                return 2
+            if len(unreachable_hosts) > 0:
+                return 3
+
+        except errors.AnsibleError, e:
+            display("ERROR: %s" % e, color='red')
+            return 1
+
+    return 0
+
+
+class AnsibleShell(cmd.Cmd):
+
+    ansible = ansible.runner.Runner()
+    groups = ansible.inventory.groups_list().keys()
+    hosts = ansible.inventory.groups_list()['all']
+    modules = []
+    serial = 2
+
+    cwd = ''
+    #print hosts  #get all hosts from config
+
+    def __init__(self, options, args):
+        self.options = options
+        self.args = args
+        self.intro = 'Welcome to the ansible-shell.\nType help or ? to list commands.\n'
+        self.set_prompt()
+        self.modules = self.list_modules()
+        for module in self.modules:
+            setattr(self, 'do_' + module, lambda arg, module=module: self.default(module + ' ' + arg))
+            setattr(self, 'help_' + module, lambda module=module: self.helpdefault(module))
+        cmd.Cmd.__init__(self)
+
+
+    @staticmethod
+    def parse_opts():
+        parser = OptionParser()
+        parser.add_option("-s", "--sudo", default=False, action="store_true",
+                          dest='sudo', help="run operations with sudo (nopasswd)")
+        parser.add_option('-U', '--sudo-user', dest='sudo_user',
+                          help='desired sudo user (default=root)', default="root")
+        parser.add_option('-t', '--timeout', dest='timeout', default=5,
+                          help='timeout (default=5)')
+        parser.add_option('-u', '--user', default=C.DEFAULT_REMOTE_USER,
+                          dest='remote_user',
+                          help='connect as this user (default=%s)' % C.DEFAULT_REMOTE_USER)
+
+        return parser.parse_args()
+
+    def get_names(self):
+        return dir(self)
+
+    def cmdloop(self):
+        try:
+            cmd.Cmd.cmdloop(self)
+        except KeyboardInterrupt:
+            self.intro = " "
+            self.cmdloop()
+
+    def set_prompt(self):
+        self.prompt = stringc(self.options.remote_user + '@/' + self.cwd, 'green')
+        if self.cwd in self.groups:
+            self.prompt += stringc(' (' + str(len(self.ansible.inventory.groups_list()[self.cwd])) + ')', 'red')
+        self.prompt += '[s:' + stringc(str(self.serial), 'green') + ']'
+        self.prompt += '$ '
+
+    def list_modules(self):
+        modules = []
+        for root, dirs, files in os.walk(C.DEFAULT_MODULE_PATH):
+            for basename in files:
+                modules.append(basename)
+
+        return modules
+
+    def default(self, arg, forceshell=False):
+        if arg.startswith("#"):
+            return False
+
+        if not self.cwd:
+            print "No host found"
+            return False
+
+        if arg.split()[0] in self.modules:
+            module = arg.split()[0]
+            module_args = ' '.join(arg.split()[1:])
+        else:
+            module = 'shell'
+            module_args = arg
+
+        if forceshell is True:
+            module = 'shell'
+            module_args = arg
+
+        try:
+            opts = self.options
+            results = ansible.runner.Runner(
+                pattern=self.cwd, forks=self.serial,  #self.cwd=localhost ; serial=2
+                module_name=module, module_args=module_args, #module=shell;module_args=pwd
+                remote_user=opts.remote_user,
+                sudo=opts.sudo, sudo_user=opts.sudo_user,
+                timeout=int(opts.timeout)
+            ).run()
+        except Exception as e:
+            print e.msg
+
+        if results is None:
+            print "No hosts found"
+            return False
+
+        for (hostname, result) in results['contacted'].items():
+            if 'stderr' in result.keys():
+                if not result['stderr']:
+                    print "%s\n%s" % (stringc(hostname, 'bright gray'), result['stdout'])   #print output
+                else:
+                    print "%s >>> %s" % (stringc(hostname, 'red'), result['stderr'])
+            else:
+                if 'failed' not in result.keys():
+                    with colorizer('bright gray'):
+                        print hostname
+                        pprint.pprint(result)
+                else:
+                    print "%s >>> %s" % (stringc(hostname, 'red'), result)
+
+        for (hostname, result) in results['dark'].items():
+            print "%s >>> %s" % (stringc(hostname, 'red'), result['msg'])
+
+    def emptyline(self):
+        return
+
+
+    def do_shell(self, arg):
+        self.default(arg, True)
+
+    def do_play(self, args):            #add by bruce
+        print readline.get_current_history_length()
+        #self.cwd=args
+        print self.cwd
+        #print self.hosts
+        ''' run ansible-playbook '''
+        display(" ", log_only=True)
+        display(" ".join(sys.argv), log_only=True)
+        display(" ", log_only=True)
+        try:
+                playmain(self.cwd,args)
+                self.set_prompt()
+        except errors.AnsibleError, e:
+                display("ERROR: %s" % e, color='red', stderr=True)
+        except KeyboardInterrupt, ke:
+                display("ERROR: interrupted", color='red', stderr=True)
+        self.set_prompt()
+
+
+    def do_serial(self, arg):
+        """Set the number of forks"""
+        self.serial = arg
+        self.set_prompt()
+
+    def do_cd(self, arg):
+        """Change active host/group"""
+        if not arg:
+            self.cwd = ''
+        elif arg == '..':
+            try:
+                self.cwd = self.ansible.inventory.groups_for_host(self.cwd)[1].name
+            except Exception:
+                self.cwd = ''
+        elif arg == '/':
+            self.cwd = ''
+        elif self.ansible.inventory.get_hosts(arg):
+            self.cwd = arg
+        else:
+            print "incorrect path"
+
+        self.set_prompt()
+
+    def do_list(self, arg):
+        """List the hosts in the current group"""
+        if arg == 'groups':
+            items = self.ansible.inventory.list_groups()
+        else:
+            items = self.ansible.inventory.list_hosts('all' if self.cwd == '' else self.cwd)
+        for item in items:
+            print item
+
+    def do_sudo(self, arg):
+        """Toggle whether plays run with sudo"""
+        self.options.sudo = not self.options.sudo
+        print "sudo changed to %s" % self.options.sudo
+
+    def do_remote_user(self, arg):
+        """Given a username, set the remote user plays are run by"""
+        if arg:
+            self.options.remote_user = arg
+            self.set_prompt()
+        else:
+            print "Please specify a remote user, e.g. `remote_user root`"
+
+    def do_sudo_user(self, arg):
+        """Given a username, set the user that plays are run by when using sudo"""
+        if arg:
+            self.options.sudo_user = arg
+        else:
+            print "Please specify a sudo user, e.g. `sudo_user jenkins`"
+            print "Current sudo user is %s" % self.options.sudo_user
+
+    def do_EOF(self, args):
+        sys.stdout.write('\n')
+        return -1
+
+    def do_exit(self, args):
+        """Exits from the console"""
+        return -1
+
+    def helpdefault(self, module_name):
+        if module_name in self.modules:
+            in_path = utils.plugins.module_finder.find_plugin(module_name)
+            oc, a = ansible.utils.module_docs.get_docstring(in_path)
+            print stringc(oc['short_description'], 'bright gray')
+            print 'Parameters:'
+            for opt in oc['options'].keys():
+                print '  ' + stringc(opt, 'white') + ' ' + oc['options'][opt]['description'][0]
+
+    def complete_cd(self, text, line, begidx, endidx):
+        mline = line.partition(' ')[2]
+        offs = len(mline) - len(text)
+
+        if self.cwd == '':
+            completions = self.hosts + self.groups
+        else:
+            completions = self.ansible.inventory.list_hosts(self.cwd)
+
+        return [s[offs:] for s in completions if s.startswith(mline)]
+
+    def completedefault(self, text, line, begidx, endidx):
+        if line.split()[0] in self.modules:
+            mline = line.split(' ')[-1]
+            offs = len(mline) - len(text)
+            completions = self.module_args(line.split()[0])
+
+            return [s[offs:] + '=' for s in completions if s.startswith(mline)]
+
+    def module_args(self, module_name):
+        in_path = utils.plugins.module_finder.find_plugin(module_name)
+        oc, a = ansible.utils.module_docs.get_docstring(in_path)
+        return oc['options'].keys()
+
+    def do_dump(self, a):
+        print readline.get_current_history_length()
+
+    def do_version(self, a):
+        print "Version=%s (%s)" % (version ,version_date)
+        print "FlexDoIT By Bruce"
+
+
+
+
+
+if __name__ == '__main__':
+    # This hack is to work around readline issues on a mac:
+    #  http://stackoverflow.com/a/7116997/541202
+    version='0.1'
+    version_date='2014-01-30'
+    if 'libedit' in readline.__doc__:
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
+    histfile = os.path.join(os.path.expanduser("~"), ".ansible-shell_history")
+    try:
+        readline.read_history_file(histfile)
+    except IOError:
+        pass
+    atexit.register(readline.write_history_file, histfile)
+
+    (options, args) = AnsibleShell.parse_opts()
+    AnsibleShell(options, args).cmdloop()
+
+
